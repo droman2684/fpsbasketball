@@ -1,0 +1,25 @@
+appId: com.empirehoops.app
+productName: Empire Hoops
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+mac:
+  icon: build/icon.icns
+  category: public.app-category.sports
+  target:
+    - target: dir
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+    - target: portable
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+publish:
+  provider: github
+  owner: droman2684
+  repo: fpsbasketball
