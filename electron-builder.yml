@@ -23,3 +23,4 @@ publish:
   provider: github
   owner: droman2684
   repo: fpsbasketball
+  releaseType: release
