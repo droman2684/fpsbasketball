@@ -1,6 +1,6 @@
 {
   "name": "empire-hoops",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Empire Hoops — desktop basketball GM career simulation",
   "main": "./out/main/index.js",
   "author": "",
