@@ -1,21 +1,31 @@
 import { describe, expect, it } from 'vitest'
 import {
+  applyTimeoutBoost,
+  finalizeGameSim,
   finalizeOffseasonToNextSeason,
   generateOffseasonCalendar,
   generateProspects,
+  initGameSim,
   resolveFreeAgentDay,
   runCombine,
+  simDays,
   simOffseasonDays,
+  simToNextQuarter,
   submitFreeAgentOffer,
   allocateScoutingEffort
 } from '@renderer/data/engine'
 import type {
   DraftProspect,
   FreeAgentNegotiation,
+  GamePlanConfig,
   LeagueConfig,
   LeagueTeamSeed,
+  LineupState,
   RosterPlayer,
-  SimDate
+  ScheduledGame,
+  SeasonCalendar,
+  SimDate,
+  TeamRecord
 } from '@shared/types'
 
 function makeProspect(overrides: Partial<DraftProspect> = {}): DraftProspect {
@@ -273,5 +283,144 @@ describe('finalizeOffseasonToNextSeason', () => {
 
     const allIds = [...result.myRoster, ...Object.values(result.rosters).flat()].map((p) => p.id)
     expect(new Set(allIds).size).toBe(allIds.length)
+  })
+})
+
+const EMPTY_LINEUP: LineupState = { starters: [], bench: [] }
+const POSITIONS = ['PG', 'SG', 'SF', 'PF', 'C']
+
+function makeGameRoster(idOffset: number, count = 10): RosterPlayer[] {
+  return Array.from({ length: count }, (_, i) =>
+    makePlayer({ id: idOffset + i, name: `Player ${idOffset + i}`, pos: POSITIONS[i % 5], ovr: 70 + (i % 10), age: 24 })
+  )
+}
+
+function makeNeutralGamePlan(): GamePlanConfig {
+  return { pace: 50, threePoint: 50, post: 50, defense: 50, fastBreak: 50, ballMovement: 50 }
+}
+
+describe('initGameSim / simToNextQuarter / finalizeGameSim', () => {
+  it('walks a full game in quarter-sized segments to a well-formed final result', () => {
+    const home = makeGameRoster(1)
+    const away = makeGameRoster(100)
+    const gamePlan = makeNeutralGamePlan()
+    const state = initGameSim(home, EMPTY_LINEUP, gamePlan, away, EMPTY_LINEUP, gamePlan, false)
+
+    let result = simToNextQuarter(state)
+    let segments = 1
+    while (!result.gameOver) {
+      result = simToNextQuarter(state)
+      segments++
+    }
+    expect(segments).toBeGreaterThanOrEqual(4)
+
+    const final = finalizeGameSim(state)
+    expect(final.home.pts).toBe(result.homePts)
+    expect(final.away.pts).toBe(result.awayPts)
+    expect(final.home.pts).not.toBe(final.away.pts)
+    expect(final.home.q[0] + final.home.q[1] + final.home.q[2] + final.home.q[3]).toBe(final.home.pts)
+    expect(final.away.q[0] + final.away.q[1] + final.away.q[2] + final.away.q[3]).toBe(final.away.pts)
+    expect(final.home.players.length).toBeGreaterThan(0)
+    expect(final.away.players.length).toBeGreaterThan(0)
+  })
+})
+
+describe('applyTimeoutBoost', () => {
+  it('measurably raises scoring for the very next segment, then clears itself', () => {
+    const gamePlan = makeNeutralGamePlan()
+    const TRIALS = 100
+    let withBoost = 0
+    let withoutBoost = 0
+    for (let i = 0; i < TRIALS; i++) {
+      const boostedState = initGameSim(makeGameRoster(1), EMPTY_LINEUP, gamePlan, makeGameRoster(100), EMPTY_LINEUP, gamePlan, false)
+      applyTimeoutBoost(boostedState, 'home', 0.3)
+      withBoost += simToNextQuarter(boostedState).quarterHomePts
+
+      const plainState = initGameSim(makeGameRoster(1), EMPTY_LINEUP, gamePlan, makeGameRoster(100), EMPTY_LINEUP, gamePlan, false)
+      withoutBoost += simToNextQuarter(plainState).quarterHomePts
+    }
+    expect(withBoost / TRIALS).toBeGreaterThan(withoutBoost / TRIALS)
+  })
+
+  it('is consumed by the next simToNextQuarter call and does not persist beyond it', () => {
+    const gamePlan = makeNeutralGamePlan()
+    const state = initGameSim(makeGameRoster(1), EMPTY_LINEUP, gamePlan, makeGameRoster(100), EMPTY_LINEUP, gamePlan, false)
+    applyTimeoutBoost(state, 'home')
+    expect(state.home.timeoutBoost).toBeGreaterThan(0)
+    simToNextQuarter(state)
+    expect(state.home.timeoutBoost).toBe(0)
+  })
+})
+
+describe('simDays pauses for the human\'s own game', () => {
+  function makeTwoTeamCalendar(): SeasonCalendar {
+    const games: ScheduledGame[] = [
+      { day: 1, date: { y: 2027, m: 1, d: 2 }, home: 'LAL', away: 'BOS' },
+      { day: 3, date: { y: 2027, m: 1, d: 4 }, home: 'BOS', away: 'LAL' }
+    ]
+    return { games, allStarDay: 0, seasonEndDay: 10 }
+  }
+
+  function baseArgs() {
+    const teams: LeagueTeamSeed[] = [
+      { abbr: 'LAL', city: 'Los Angeles', name: 'Lakers', primary: '#552583', secondary: '#FDB927', confIndex: 0 },
+      { abbr: 'BOS', city: 'Boston', name: 'Celtics', primary: '#007A33', secondary: '#BA9653', confIndex: 1 }
+    ]
+    const records: Record<string, TeamRecord> = { LAL: { w: 0, l: 0, l10: '0-0' }, BOS: { w: 0, l: 0, l10: '0-0' } }
+    return {
+      teams,
+      records,
+      rosters: { BOS: makeGameRoster(100) },
+      simDate: { y: 2027, m: 1, d: 1 } as SimDate,
+      simDay: 0,
+      calendar: makeTwoTeamCalendar(),
+      myTeam: 'LAL',
+      myRoster: makeGameRoster(1),
+      lineup: EMPTY_LINEUP,
+      gamePlan: makeNeutralGamePlan(),
+      pendingOffers: [],
+      pickAssets: [],
+      currentYear: 2027
+    }
+  }
+
+  it('halts before processing the day of the human\'s game, rolling simDay back to the day before it', () => {
+    const result = simDays({ ...baseArgs(), n: 5, autoResolveUserGames: false })
+    expect(result.pendingUserGame).not.toBeNull()
+    expect(result.pendingUserGame?.day).toBe(1)
+    expect(result.simDay).toBe(0)
+  })
+
+  it('resolves that one day when re-invoked with autoResolveUserGames, then the batch can continue and pause again at the next human game', () => {
+    const args = baseArgs()
+    const firstPause = simDays({ ...args, n: 5, autoResolveUserGames: false })
+    expect(firstPause.pendingUserGame).not.toBeNull()
+
+    const resolved = simDays({
+      ...args,
+      records: firstPause.records,
+      rosters: firstPause.rosters,
+      myRoster: firstPause.myRoster,
+      simDate: firstPause.simDate,
+      simDay: firstPause.simDay,
+      n: 1,
+      autoResolveUserGames: true
+    })
+    expect(resolved.pendingUserGame).toBeNull()
+    expect(resolved.simDay).toBe(1)
+    expect(resolved.lastBoxScore).not.toBeNull()
+
+    const secondPause = simDays({
+      ...args,
+      records: resolved.records,
+      rosters: resolved.rosters,
+      myRoster: resolved.myRoster,
+      simDate: resolved.simDate,
+      simDay: resolved.simDay,
+      n: 4,
+      autoResolveUserGames: false
+    })
+    expect(secondPause.pendingUserGame).not.toBeNull()
+    expect(secondPause.pendingUserGame?.day).toBe(3)
   })
 })

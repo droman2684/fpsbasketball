@@ -1,10 +1,14 @@
 import { create } from 'zustand'
 import {
+  applyGameResult,
   applyProgression,
+  applyTimeoutBoost,
   autoLineup,
   buildLeagueTeams,
   cloneMyRosterTemplate,
+  deriveCpuGamePlan,
   evaluateTradeForTeam,
+  finalizeGameSim,
   finalizeOffseasonToNextSeason as advanceToNextSeasonEngine,
   generateOneRoster,
   generatePlayerPool,
@@ -12,6 +16,7 @@ import {
   generateProspects,
   generateSeasonCalendar,
   genLeagueRosters,
+  initGameSim,
   pickBestProspectForTeam,
   pickLabel,
   playerValue,
@@ -22,13 +27,16 @@ import {
   simDays as simDaysEngine,
   simOffseasonDays as simOffseasonDaysEngine,
   simPlayoffDay as simPlayoffDayEngine,
+  simToNextQuarter,
   submitFreeAgentOffer as submitFreeAgentOfferEngine,
+  type GameSimState,
   type LeagueTeam,
   type PickValuationContext
 } from '@renderer/data/engine'
 import { TEAM_DATA } from '@renderer/data/teams'
 import type {
   BoxScore,
+  BoxScorePlayerLine,
   DraftPhase,
   DraftPick,
   DraftPickAsset,
@@ -44,6 +52,7 @@ import type {
   ProgressionEntry,
   RosterPlayer,
   RuleFlags,
+  ScheduledGame,
   SeasonCalendar,
   SeasonPhase,
   SimDate,
@@ -55,6 +64,28 @@ import type {
 } from '@shared/types'
 
 export type NavDropdown = 'gm' | 'coach' | 'league' | 'comm' | null
+
+// Deliberately NOT part of GameSnapshot/persistence — a live game is a
+// short (~5 minute), single-session activity; closing the app mid-game loses
+// that game's progress rather than needing a serializable mid-possession
+// save format (GameSimState holds a Map, which JSON.stringify can't round-trip).
+interface LiveGameState {
+  gameSimState: GameSimState
+  game: ScheduledGame
+  mySide: 'home' | 'away'
+  opponent: string
+  opponentName: string
+  opponentColor: string
+  timeoutsRemaining: number
+  homePts: number
+  awayPts: number
+  homePreview: BoxScorePlayerLine[]
+  awayPreview: BoxScorePlayerLine[]
+  gameOver: boolean
+  // How many days of the original SIM WEEK/MONTH batch are still owed once
+  // this game resolves — resumed via runSim once the live game finishes.
+  remainingBatchDays: number
+}
 
 interface GameState {
   initialized: boolean
@@ -125,6 +156,10 @@ interface GameState {
   allStarMvp: string | null
   transactions: TransactionEntry[]
 
+  pendingUserGame: ScheduledGame | null
+  pendingBatchDaysRemaining: number
+  liveGame: LiveGameState | null
+
   initGame: (config: LeagueConfig) => void
   goToPage: (page: string) => void
   goHome: () => void
@@ -166,6 +201,11 @@ interface GameState {
   simOffseasonWeek1: () => void
   simOffseasonMonth1: () => void
   startNextSeason: () => void
+
+  resolvePendingUserGameAutomatically: () => void
+  startLiveGame: () => void
+  advanceLiveGameQuarter: () => void
+  callLiveGameTimeout: () => void
 
   initDraft: () => void
   runLottery: () => void
@@ -249,25 +289,16 @@ function reconcileLineup(lineup: LineupState, roster: RosterPlayer[], addedIds: 
   return { starters, bench }
 }
 
-function runSim(n: number, get: () => GameState, set: (partial: Partial<GameState>) => void): void {
+// Shared by runSim and resolvePendingUserGameAutomatically — both call
+// simDaysEngine themselves (only `n`/`autoResolveUserGames` differ) and then
+// apply the exact same patch-building logic here.
+function applySimDaysResult(
+  result: ReturnType<typeof simDaysEngine>,
+  n: number,
+  get: () => GameState,
+  set: (partial: Partial<GameState>) => void
+): void {
   const s = get()
-  if (s.seasonPhase !== 'regular') return
-  const result = simDaysEngine({
-    n,
-    teams: s.leagueTeams,
-    records: s.records,
-    rosters: s.rosters,
-    simDate: s.simDate,
-    simDay: s.simDay,
-    calendar: s.calendar,
-    myTeam: s.myTeam,
-    myRoster: s.myRoster,
-    lineup: s.lineup,
-    gamePlan: s.gamePlan,
-    pendingOffers: s.pendingOffers,
-    pickAssets: s.draftPickAssets,
-    currentYear: s.draftYear
-  })
   const { roster, log } = applyProgression(n, result.myRoster)
   const patch: Partial<GameState> = {
     records: result.records,
@@ -288,11 +319,41 @@ function runSim(n: number, get: () => GameState, set: (partial: Partial<GameStat
     patch.allStarResult = result.allStarResult
     patch.allStarMvp = result.allStarMvp
   }
-  if (result.seasonComplete && s.config) {
-    patch.seasonPhase = 'playoffs'
-    patch.playoffs = seedPlayoffBracket(s.leagueTeams, result.records, s.config)
+  if (result.pendingUserGame) {
+    patch.pendingUserGame = result.pendingUserGame
+    patch.pendingBatchDaysRemaining = n - (result.simDay - s.simDay)
+  } else {
+    patch.pendingUserGame = null
+    patch.pendingBatchDaysRemaining = 0
+    if (result.seasonComplete && s.config) {
+      patch.seasonPhase = 'playoffs'
+      patch.playoffs = seedPlayoffBracket(s.leagueTeams, result.records, s.config)
+    }
   }
   set(patch)
+}
+
+function runSim(n: number, get: () => GameState, set: (partial: Partial<GameState>) => void): void {
+  const s = get()
+  if (s.seasonPhase !== 'regular') return
+  const result = simDaysEngine({
+    n,
+    teams: s.leagueTeams,
+    records: s.records,
+    rosters: s.rosters,
+    simDate: s.simDate,
+    simDay: s.simDay,
+    calendar: s.calendar,
+    myTeam: s.myTeam,
+    myRoster: s.myRoster,
+    lineup: s.lineup,
+    gamePlan: s.gamePlan,
+    pendingOffers: s.pendingOffers,
+    pickAssets: s.draftPickAssets,
+    currentYear: s.draftYear,
+    autoResolveUserGames: false
+  })
+  applySimDaysResult(result, n, get, set)
 }
 
 function runOffseasonSim(n: number, get: () => GameState, set: (partial: Partial<GameState>) => void): void {
@@ -401,6 +462,9 @@ export const useGameStore = create<GameState>((set, get) => ({
   allStarResult: null,
   allStarMvp: null,
   transactions: [],
+  pendingUserGame: null,
+  pendingBatchDaysRemaining: 0,
+  liveGame: null,
 
   initGame: (config) => {
     const leagueTeams = buildLeagueTeams(config)
@@ -477,7 +541,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       lineup,
       allStarResult: null,
       allStarMvp: null,
-      transactions: []
+      transactions: [],
+      pendingUserGame: null,
+      pendingBatchDaysRemaining: 0,
+      liveGame: null
     })
   },
 
@@ -707,6 +774,137 @@ export const useGameStore = create<GameState>((set, get) => ({
   simWeek1: () => runSim(7, get, set),
   simMonth1: () => runSim(30, get, set),
 
+  resolvePendingUserGameAutomatically: () => {
+    const s = get()
+    if (!s.pendingUserGame || s.seasonPhase !== 'regular') return
+    const remaining = s.pendingBatchDaysRemaining
+    const result = simDaysEngine({
+      n: 1,
+      teams: s.leagueTeams,
+      records: s.records,
+      rosters: s.rosters,
+      simDate: s.simDate,
+      simDay: s.simDay,
+      calendar: s.calendar,
+      myTeam: s.myTeam,
+      myRoster: s.myRoster,
+      lineup: s.lineup,
+      gamePlan: s.gamePlan,
+      pendingOffers: s.pendingOffers,
+      pickAssets: s.draftPickAssets,
+      currentYear: s.draftYear,
+      autoResolveUserGames: true
+    })
+    applySimDaysResult(result, 1, get, set)
+    if (remaining > 0 && get().seasonPhase === 'regular') runSim(remaining, get, set)
+  },
+
+  startLiveGame: () =>
+    set((s) => {
+      const g = s.pendingUserGame
+      if (!g) return {}
+      const myIsHome = g.home === s.myTeam
+      const oppAbbr = myIsHome ? g.away : g.home
+      const oppRoster = s.rosters[oppAbbr] ?? []
+      const oppLineup = autoLineup(oppRoster)
+      const oppGamePlan = deriveCpuGamePlan(oppRoster, oppLineup)
+      const homeRoster = myIsHome ? s.myRoster : oppRoster
+      const homeLineup = myIsHome ? s.lineup : oppLineup
+      const homeGamePlan = myIsHome ? s.gamePlan : oppGamePlan
+      const awayRoster = myIsHome ? oppRoster : s.myRoster
+      const awayLineup = myIsHome ? oppLineup : s.lineup
+      const awayGamePlan = myIsHome ? oppGamePlan : s.gamePlan
+      const gameSimState = initGameSim(homeRoster, homeLineup, homeGamePlan, awayRoster, awayLineup, awayGamePlan, false)
+      const oppTeam = s.leagueTeams.find((t) => t.abbr === oppAbbr)
+      return {
+        pendingUserGame: null,
+        page: 'playGame',
+        liveGame: {
+          gameSimState,
+          game: g,
+          mySide: myIsHome ? 'home' : 'away',
+          opponent: oppAbbr,
+          opponentName: oppTeam ? `${oppTeam.city} ${oppTeam.name}` : oppAbbr,
+          opponentColor: oppTeam?.primary ?? '#767672',
+          timeoutsRemaining: 3,
+          homePts: 0,
+          awayPts: 0,
+          homePreview: [],
+          awayPreview: [],
+          gameOver: false,
+          remainingBatchDays: s.pendingBatchDaysRemaining
+        }
+      }
+    }),
+
+  advanceLiveGameQuarter: () => {
+    const s = get()
+    const lg = s.liveGame
+    if (!lg || lg.gameOver) return
+    const homeGamePlan = lg.mySide === 'home' ? s.gamePlan : undefined
+    const awayGamePlan = lg.mySide === 'away' ? s.gamePlan : undefined
+    const q = simToNextQuarter(lg.gameSimState, homeGamePlan, awayGamePlan)
+
+    if (!q.gameOver) {
+      set({
+        liveGame: {
+          ...lg,
+          homePts: q.homePts,
+          awayPts: q.awayPts,
+          homePreview: q.homePreview,
+          awayPreview: q.awayPreview
+        }
+      })
+      return
+    }
+
+    // Final quarter/OT settled it — finalize, apply the same bookkeeping an
+    // auto-resolved game gets, then resume whatever's left of the original batch.
+    const result = finalizeGameSim(lg.gameSimState)
+    const myRosterNow = s.myRoster
+    const oppRosterNow = s.rosters[lg.opponent] ?? []
+    const homeRosterNow = lg.mySide === 'home' ? myRosterNow : oppRosterNow
+    const awayRosterNow = lg.mySide === 'home' ? oppRosterNow : myRosterNow
+    const nextRecords: Record<string, TeamRecord> = {
+      ...s.records,
+      [lg.game.home]: { ...s.records[lg.game.home] },
+      [lg.game.away]: { ...s.records[lg.game.away] }
+    }
+    // Use the game's own scheduled day/date, not s.simDay/simDate — those are
+    // still rolled back to the day *before* this game (that's how simDays
+    // signaled the pause in the first place).
+    const update = applyGameResult(lg.game, result, nextRecords, homeRosterNow, awayRosterNow, s.myTeam, s.leagueTeams, lg.game.day, lg.game.date)
+    const myRosterNext = lg.mySide === 'home' ? update.homeRoster : update.awayRoster
+    const oppRosterNext = lg.mySide === 'home' ? update.awayRoster : update.homeRoster
+    const { roster: progressedRoster, log } = applyProgression(1, myRosterNext)
+
+    set({
+      records: nextRecords,
+      rosters: { ...s.rosters, [lg.opponent]: oppRosterNext },
+      myRoster: progressedRoster,
+      simDay: lg.game.day,
+      simDate: lg.game.date,
+      progressionLog: [...log, ...s.progressionLog].slice(0, 15),
+      simResults: update.newResult ? [update.newResult, ...s.simResults].slice(0, 10) : s.simResults,
+      lastBoxScore: update.boxScore ?? s.lastBoxScore,
+      liveGame: null,
+      page: 'home'
+    })
+
+    // remainingBatchDays counted this now-resolved game as one of its days —
+    // same "- 1" the auto-resolve path applies for the same reason.
+    const remaining = lg.remainingBatchDays
+    if (remaining > 1 && get().seasonPhase === 'regular') runSim(remaining - 1, get, set)
+  },
+
+  callLiveGameTimeout: () =>
+    set((s) => {
+      const lg = s.liveGame
+      if (!lg || lg.timeoutsRemaining <= 0 || lg.gameOver) return {}
+      applyTimeoutBoost(lg.gameSimState, lg.mySide)
+      return { liveGame: { ...lg, timeoutsRemaining: lg.timeoutsRemaining - 1 } }
+    }),
+
   simPlayoffs1Day: () =>
     set((s) => {
       if (s.seasonPhase !== 'playoffs' || !s.playoffs || !s.config) return {}
@@ -774,6 +972,9 @@ export const useGameStore = create<GameState>((set, get) => ({
         offseasonCalendar: null,
         offseasonDay: 0,
         offseasonPhase: null,
+        pendingUserGame: null,
+        pendingBatchDaysRemaining: 0,
+        liveGame: null,
         draftPhase: 'off' as DraftPhase,
         draftProspects: null,
         draftCurrentPick: 0,

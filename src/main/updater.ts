@@ -1,5 +1,10 @@
 import { app, dialog } from 'electron'
-import { autoUpdater } from 'electron-updater'
+// electron-updater is CommonJS — under this project's ESM build, named
+// imports don't interop correctly (throws "Named export 'autoUpdater' not
+// found" at runtime even though it type-checks fine). Import the default and
+// destructure instead.
+import electronUpdater from 'electron-updater'
+const { autoUpdater } = electronUpdater
 
 // Auto-update only makes sense for a packaged, installed build — a dev run
 // has no publish feed to check against and no installer to relaunch into.

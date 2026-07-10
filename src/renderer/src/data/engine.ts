@@ -605,6 +605,10 @@ interface SimSide {
   gamePlan: GamePlanConfig
   lines: Map<number, PlayerGameLine & { onFloor: number }>
   pts: number
+  // Flat make-probability bump from a just-called timeout — set by
+  // applyTimeoutBoost, consumed for exactly one simToNextQuarter segment,
+  // then cleared. Always 0 for the whole-game simulateGame path.
+  timeoutBoost: number
 }
 
 function makeSide(roster: RosterPlayer[], lineup: LineupState, gamePlan: GamePlanConfig): SimSide {
@@ -639,7 +643,7 @@ function makeSide(roster: RosterPlayer[], lineup: LineupState, gamePlan: GamePla
       onFloor: 0
     })
   })
-  return { eligible, gamePlan, lines, pts: 0 }
+  return { eligible, gamePlan, lines, pts: 0, timeoutBoost: 0 }
 }
 
 function finalizeSide(side: SimSide, otPeriods: number, possessionsPerTeam: number, otPossessionsPerTeam: number): PlayerGameLine[] {
@@ -736,7 +740,11 @@ function runPossession(offense: SimSide, defense: SimSide, isHome: boolean, neut
     const homeEdge = isHome && !neutralSite ? 0.015 : 0
     const paintFB = shotType === 'paint' ? sliderEffect(offense.gamePlan.fastBreak, 0.08) : 0
     const threeBM = shotType === 'three' ? sliderEffect(offense.gamePlan.ballMovement, 0.06) : 0
-    const makeProb = clampNum(BASE_FG[shotType] + skill + defTerm - defenseSliderPenalty + homeEdge + paintFB + threeBM, 0.12, 0.85)
+    const makeProb = clampNum(
+      BASE_FG[shotType] + skill + defTerm - defenseSliderPenalty + homeEdge + paintFB + threeBM + offense.timeoutBoost,
+      0.12,
+      0.85
+    )
 
     const line = offense.lines.get(shooter.p.id)!
     line.fga += 1
@@ -790,12 +798,40 @@ function runPossession(offense: SimSide, defense: SimSide, isHome: boolean, neut
   }
 }
 
-// The core possession-by-possession simulator: every made/missed shot,
-// rebound, assist, turnover, and foul actually happens and gets tallied, so
-// the final score and every box-score stat emerge organically rather than
-// being reverse-engineered from a pre-decided random total. `neutralSite`
-// (true for playoffs, matching prior behavior) zeroes the home-court edge.
-export function simulateGame(
+// ─────────────────────────────────────────────────────────────────────────
+// Resumable game simulation — initGameSim/simToNextQuarter/finalizeGameSim
+// let a caller (the interactive "play through your own game" flow) run one
+// quarter at a time, tweaking gamePlan or applying a timeout boost between
+// segments. `simulateGame` below is a thin wrapper over the same three
+// primitives, so every existing caller (CPU-vs-CPU days, playoffs, the
+// All-Star Game) is completely unaffected — same signature, same result.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface GameSimState {
+  home: SimSide
+  away: SimSide
+  neutralSite: boolean
+  possessionsPerTeam: number
+  otPossessionsPerTeam: number
+  quarterBounds: number[]
+  eventIdx: number
+  quarterIdx: number
+  offenseIsHome: boolean
+  scoreSnapshots: Array<[number, number]>
+  otPeriods: number
+  wentToOT: boolean
+  regHomePts: number
+  regAwayPts: number
+  homeRoster: RosterPlayer[]
+  homeLineup: LineupState
+  awayRoster: RosterPlayer[]
+  awayLineup: LineupState
+}
+
+// Builds both sides and precomputes the whole game's possession budget and
+// quarter boundaries, but runs zero possessions — call simToNextQuarter to
+// actually advance play.
+export function initGameSim(
   homeRoster: RosterPlayer[],
   homeLineup: LineupState,
   homeGamePlan: GamePlanConfig,
@@ -803,7 +839,7 @@ export function simulateGame(
   awayLineup: LineupState,
   awayGamePlan: GamePlanConfig,
   neutralSite = false
-): GameSimResult {
+): GameSimState {
   const home = makeSide(homeRoster, homeLineup, homeGamePlan)
   const away = makeSide(awayRoster, awayLineup, awayGamePlan)
 
@@ -814,63 +850,163 @@ export function simulateGame(
   const possessionsPerTeam = clampNum(Math.round(85 + gamePace * 0.35), 80, 120)
   const totalEvents = possessionsPerTeam * 2
   const quarterBounds = [0.25, 0.5, 0.75, 1].map((f) => Math.round(totalEvents * f))
+  const otPossessionsPerTeam = Math.max(6, Math.round((possessionsPerTeam * 5) / 48))
 
-  const scoreSnapshots: Array<[number, number]> = [[0, 0]]
-  let quarterIdx = 0
-  let offenseIsHome = true
-  for (let ev = 0; ev < totalEvents; ev++) {
-    if (offenseIsHome) runPossession(home, away, true, neutralSite)
-    else runPossession(away, home, false, neutralSite)
-    offenseIsHome = !offenseIsHome
+  return {
+    home,
+    away,
+    neutralSite,
+    possessionsPerTeam,
+    otPossessionsPerTeam,
+    quarterBounds,
+    eventIdx: 0,
+    quarterIdx: 0,
+    offenseIsHome: true,
+    scoreSnapshots: [[0, 0]],
+    otPeriods: 0,
+    wentToOT: false,
+    regHomePts: 0,
+    regAwayPts: 0,
+    homeRoster,
+    homeLineup,
+    awayRoster,
+    awayLineup
+  }
+}
 
-    if (quarterIdx < 4 && ev + 1 === quarterBounds[quarterIdx]) {
-      scoreSnapshots.push([home.pts, away.pts])
-      quarterIdx++
+export interface QuarterSimResult {
+  quarterHomePts: number
+  quarterAwayPts: number
+  homePts: number
+  awayPts: number
+  // True once regulation-or-OT has produced a non-tied final score — the
+  // signal to stop calling simToNextQuarter and call finalizeGameSim.
+  gameOver: boolean
+  homePreview: BoxScorePlayerLine[]
+  awayPreview: BoxScorePlayerLine[]
+}
+
+// Advances play by exactly one quarter (regulation) or one extra period
+// (once regulation ends tied) — never more, never less. Optionally swaps in
+// a new gamePlan for either side first (already read fresh every possession
+// inside runPossession, so no side rebuild needed). Any timeoutBoost applied
+// via applyTimeoutBoost is consumed by this segment's possessions, then
+// cleared, matching "for the rest of this quarter only."
+export function simToNextQuarter(state: GameSimState, homeGamePlan?: GamePlanConfig, awayGamePlan?: GamePlanConfig): QuarterSimResult {
+  if (homeGamePlan) state.home.gamePlan = homeGamePlan
+  if (awayGamePlan) state.away.gamePlan = awayGamePlan
+
+  const homePtsBefore = state.home.pts
+  const awayPtsBefore = state.away.pts
+
+  if (state.quarterIdx < 4) {
+    const targetEvent = state.quarterBounds[state.quarterIdx]
+    while (state.eventIdx < targetEvent) {
+      if (state.offenseIsHome) runPossession(state.home, state.away, true, state.neutralSite)
+      else runPossession(state.away, state.home, false, state.neutralSite)
+      state.offenseIsHome = !state.offenseIsHome
+      state.eventIdx++
+    }
+    state.scoreSnapshots.push([state.home.pts, state.away.pts])
+    state.quarterIdx++
+    if (state.quarterIdx === 4) {
+      state.regHomePts = state.home.pts
+      state.regAwayPts = state.away.pts
+    }
+  } else {
+    // Regulation ties are always broken by at least one OT period, regardless
+    // of the (otherwise-inert) RuleFlags.overtime toggle — simpler than
+    // modeling the flag's implied alternate tiebreaker format.
+    state.wentToOT = true
+    state.otPeriods++
+    let otOffenseIsHome = true
+    for (let ev = 0; ev < state.otPossessionsPerTeam * 2; ev++) {
+      if (otOffenseIsHome) runPossession(state.home, state.away, true, state.neutralSite)
+      else runPossession(state.away, state.home, false, state.neutralSite)
+      otOffenseIsHome = !otOffenseIsHome
+    }
+    if (state.otPeriods >= 4 && state.home.pts === state.away.pts) {
+      // Astronomically unlikely after 4 OT periods — break via team strength,
+      // coin flip only on exact equality.
+      const sh = teamStrength(state.homeRoster, state.homeLineup)
+      const sa = teamStrength(state.awayRoster, state.awayLineup)
+      if (sh > sa || (sh === sa && Math.random() < 0.5)) state.home.pts += 1
+      else state.away.pts += 1
     }
   }
 
+  state.home.timeoutBoost = 0
+  state.away.timeoutBoost = 0
+
+  return {
+    quarterHomePts: state.home.pts - homePtsBefore,
+    quarterAwayPts: state.away.pts - awayPtsBefore,
+    homePts: state.home.pts,
+    awayPts: state.away.pts,
+    gameOver: state.quarterIdx >= 4 && state.home.pts !== state.away.pts,
+    homePreview: finalizeSide(state.home, state.otPeriods, state.possessionsPerTeam, state.otPossessionsPerTeam).map(lineToBoxLine),
+    awayPreview: finalizeSide(state.away, state.otPeriods, state.possessionsPerTeam, state.otPossessionsPerTeam).map(lineToBoxLine)
+  }
+}
+
+// Sets a flat make-probability bump for `side` that the *next*
+// simToNextQuarter call will apply and then clear — modeling "settle the
+// team down, draw up a good look" without a broader momentum/fatigue system.
+export function applyTimeoutBoost(state: GameSimState, side: 'home' | 'away', amount = 0.05): void {
+  state[side].timeoutBoost = amount
+}
+
+// Only valid once simToNextQuarter has reported gameOver — converts final
+// on-floor slot counts into minutes and assembles the quarter-by-quarter
+// score breakdown from the snapshots taken along the way.
+export function finalizeGameSim(state: GameSimState): GameSimResult {
   const qHome: [number, number, number, number] = [0, 0, 0, 0]
   const qAway: [number, number, number, number] = [0, 0, 0, 0]
   for (let q = 0; q < 4; q++) {
-    qHome[q] = scoreSnapshots[q + 1][0] - scoreSnapshots[q][0]
-    qAway[q] = scoreSnapshots[q + 1][1] - scoreSnapshots[q][1]
+    qHome[q] = state.scoreSnapshots[q + 1][0] - state.scoreSnapshots[q][0]
+    qAway[q] = state.scoreSnapshots[q + 1][1] - state.scoreSnapshots[q][1]
   }
-  const regHomePts = home.pts
-  const regAwayPts = away.pts
-
-  // Regulation ties are always broken by at least one OT period, regardless
-  // of the (otherwise-inert) RuleFlags.overtime toggle — simpler than
-  // modeling the flag's implied alternate tiebreaker format.
-  let otPeriods = 0
-  let wentToOT = false
-  const otPossessionsPerTeam = Math.max(6, Math.round((possessionsPerTeam * 5) / 48))
-  while (home.pts === away.pts && otPeriods < 4) {
-    wentToOT = true
-    otPeriods++
-    let otOffenseIsHome = true
-    for (let ev = 0; ev < otPossessionsPerTeam * 2; ev++) {
-      if (otOffenseIsHome) runPossession(home, away, true, neutralSite)
-      else runPossession(away, home, false, neutralSite)
-      otOffenseIsHome = !otOffenseIsHome
-    }
-  }
-  if (home.pts === away.pts) {
-    // Astronomically unlikely after 4 OT periods — break via team strength,
-    // coin flip only on exact equality.
-    const sh = teamStrength(homeRoster, homeLineup)
-    const sa = teamStrength(awayRoster, awayLineup)
-    if (sh > sa || (sh === sa && Math.random() < 0.5)) home.pts += 1
-    else away.pts += 1
-  }
-  qHome[3] += home.pts - regHomePts
-  qAway[3] += away.pts - regAwayPts
+  qHome[3] += state.home.pts - state.regHomePts
+  qAway[3] += state.away.pts - state.regAwayPts
 
   return {
-    home: { pts: home.pts, q: qHome, players: finalizeSide(home, otPeriods, possessionsPerTeam, otPossessionsPerTeam) },
-    away: { pts: away.pts, q: qAway, players: finalizeSide(away, otPeriods, possessionsPerTeam, otPossessionsPerTeam) },
-    wentToOT,
-    otPeriods
+    home: {
+      pts: state.home.pts,
+      q: qHome,
+      players: finalizeSide(state.home, state.otPeriods, state.possessionsPerTeam, state.otPossessionsPerTeam)
+    },
+    away: {
+      pts: state.away.pts,
+      q: qAway,
+      players: finalizeSide(state.away, state.otPeriods, state.possessionsPerTeam, state.otPossessionsPerTeam)
+    },
+    wentToOT: state.wentToOT,
+    otPeriods: state.otPeriods
   }
+}
+
+// The core possession-by-possession simulator: every made/missed shot,
+// rebound, assist, turnover, and foul actually happens and gets tallied, so
+// the final score and every box-score stat emerge organically rather than
+// being reverse-engineered from a pre-decided random total. `neutralSite`
+// (true for playoffs, matching prior behavior) zeroes the home-court edge.
+// A thin wrapper over initGameSim/simToNextQuarter/finalizeGameSim — see
+// those for the interactive, one-quarter-at-a-time version of this same sim.
+export function simulateGame(
+  homeRoster: RosterPlayer[],
+  homeLineup: LineupState,
+  homeGamePlan: GamePlanConfig,
+  awayRoster: RosterPlayer[],
+  awayLineup: LineupState,
+  awayGamePlan: GamePlanConfig,
+  neutralSite = false
+): GameSimResult {
+  const state = initGameSim(homeRoster, homeLineup, homeGamePlan, awayRoster, awayLineup, awayGamePlan, neutralSite)
+  let result = simToNextQuarter(state)
+  while (!result.gameOver) {
+    result = simToNextQuarter(state)
+  }
+  return finalizeGameSim(state)
 }
 
 function lineToBoxLine(l: PlayerGameLine): BoxScorePlayerLine {
@@ -1662,6 +1798,11 @@ export interface SimDaysArgs {
   pendingOffers: TradeOffer[]
   pickAssets: DraftPickAsset[]
   currentYear: number
+  // When false (the default UI path), simDays halts the instant a day
+  // containing the human's own game is reached — see pendingUserGame below.
+  // The "play it out" flow calls back in with this true for just that one
+  // day once the human chooses to auto-resolve instead.
+  autoResolveUserGames: boolean
 }
 
 export interface SimDaysResult {
@@ -1678,6 +1819,70 @@ export interface SimDaysResult {
   seasonComplete: boolean
   newTransactions: TransactionEntry[]
   pickAssets: DraftPickAsset[]
+  // Set (and the loop halted, before any of that day's games run) the moment
+  // a day scheduling the human's own game is reached with
+  // autoResolveUserGames false. simDate/simDay are rolled back to the day
+  // before it, so a follow-up call naturally re-reaches the same day.
+  pendingUserGame: ScheduledGame | null
+}
+
+export interface GameResultUpdate {
+  homeRoster: RosterPlayer[]
+  awayRoster: RosterPlayer[]
+  newResult: SimDaysResult['newResults'][number] | null
+  boxScore: BoxScore | null
+}
+
+// Applies one resolved game's outcome: bumps the win/loss record (mutates
+// `records` in place, matching simDays' own accumulator style), accumulates
+// season stats and rolls injuries for both rosters, and builds the
+// human-facing result entry/box score when the human's team was involved.
+// Shared by simDays' auto-resolve path and the interactive live-game finish
+// (gameStore's advanceLiveGameQuarter), so both apply identical bookkeeping.
+export function applyGameResult(
+  game: ScheduledGame,
+  result: GameSimResult,
+  records: Record<string, TeamRecord>,
+  homeRosterNow: RosterPlayer[],
+  awayRosterNow: RosterPlayer[],
+  myTeam: string,
+  teams: LeagueTeam[],
+  day: number,
+  date: SimDate
+): GameResultUpdate {
+  const homeWon = result.home.pts > result.away.pts
+  const winT = homeWon ? game.home : game.away
+  const loseT = homeWon ? game.away : game.home
+  records[winT].w++
+  records[loseT].l++
+
+  const playedHome = new Set(result.home.players.filter((p) => p.min > 0).map((p) => p.id))
+  const playedAway = new Set(result.away.players.filter((p) => p.min > 0).map((p) => p.id))
+  const homeRoster = maybeInjure(accumulateSeasonStats(homeRosterNow, result.home.players), playedHome, day)
+  const awayRoster = maybeInjure(accumulateSeasonStats(awayRosterNow, result.away.players), playedAway, day)
+
+  let newResult: GameResultUpdate['newResult'] = null
+  let boxScore: BoxScore | null = null
+  if (game.home === myTeam || game.away === myTeam) {
+    const myIsHome = game.home === myTeam
+    const myWon = myIsHome ? homeWon : !homeWon
+    const opp = myIsHome ? game.away : game.home
+    const myPts = myIsHome ? result.home.pts : result.away.pts
+    const oppPts = myIsHome ? result.away.pts : result.home.pts
+    newResult = { opp, myPts, oppPts, won: myWon, d: date.d, m: date.m }
+    const td = teams.find((t) => t.abbr === opp)
+    boxScore = toBoxScore(
+      result,
+      myIsHome ? 'home' : 'away',
+      opp,
+      td ? `${td.city} ${td.name}` : opp,
+      td?.primary ?? '#767672',
+      `${date.m}/${date.d}`,
+      myWon
+    )
+  }
+
+  return { homeRoster, awayRoster, newResult, boxScore }
 }
 
 function maybeInjure(roster: RosterPlayer[], playedIds: Set<number>, day: number): RosterPlayer[] {
@@ -1839,6 +2044,7 @@ export function simDays(args: SimDaysArgs): SimDaysResult {
   let seasonComplete = false
   const newTransactions: TransactionEntry[] = []
   let pickAssets = [...args.pickAssets]
+  let pendingUserGame: ScheduledGame | null = null
 
   const gamesByDay = new Map<number, ScheduledGame[]>()
   calendar.games.forEach((g) => {
@@ -1874,6 +2080,17 @@ export function simDays(args: SimDaysArgs): SimDaysResult {
     }
 
     const todaysGames = gamesByDay.get(day) ?? []
+    const myGameToday = todaysGames.find((g) => g.home === myTeam || g.away === myTeam)
+    if (myGameToday && !args.autoResolveUserGames) {
+      // Hold here — roll back the increment we just did so a follow-up call
+      // (auto-resolve or after the interactive game finishes) re-reaches this
+      // exact day rather than skipping it.
+      day--
+      date = addDays(date, -1)
+      pendingUserGame = myGameToday
+      break
+    }
+
     todaysGames.forEach((g) => {
       const hr = nextRecords[g.home]
       const ar = nextRecords[g.away]
@@ -1885,39 +2102,11 @@ export function simDays(args: SimDaysArgs): SimDaysResult {
       const homeGamePlan = g.home === myTeam ? args.gamePlan : deriveCpuGamePlan(homeRosterNow, homeLineupNow)
       const awayGamePlan = g.away === myTeam ? args.gamePlan : deriveCpuGamePlan(awayRosterNow, awayLineupNow)
       const result = simulateGame(homeRosterNow, homeLineupNow, homeGamePlan, awayRosterNow, awayLineupNow, awayGamePlan, false)
-      const homeWon = result.home.pts > result.away.pts
-      const winT = homeWon ? g.home : g.away
-      const loseT = homeWon ? g.away : g.home
-      nextRecords[winT].w++
-      nextRecords[loseT].l++
-
-      setRosterOf(g.home, accumulateSeasonStats(homeRosterNow, result.home.players))
-      setRosterOf(g.away, accumulateSeasonStats(awayRosterNow, result.away.players))
-
-      if (g.home === myTeam || g.away === myTeam) {
-        const myIsHome = g.home === myTeam
-        const myWon = myIsHome ? homeWon : !homeWon
-        const opp = myIsHome ? g.away : g.home
-        const myPts = myIsHome ? result.home.pts : result.away.pts
-        const oppPts = myIsHome ? result.away.pts : result.home.pts
-        newResults.unshift({ opp, myPts, oppPts, won: myWon, d: date.d, m: date.m })
-        const td = teams.find((t) => t.abbr === opp)
-        lastBoxScore = toBoxScore(
-          result,
-          myIsHome ? 'home' : 'away',
-          opp,
-          td ? `${td.city} ${td.name}` : opp,
-          td?.primary ?? '#767672',
-          `${date.m}/${date.d}`,
-          myWon
-        )
-      }
-
-      // Dynamic injuries: only the players who actually logged minutes are at risk.
-      const playedHome = new Set(result.home.players.filter((p) => p.min > 0).map((p) => p.id))
-      const playedAway = new Set(result.away.players.filter((p) => p.min > 0).map((p) => p.id))
-      setRosterOf(g.home, maybeInjure(rosterOf(g.home), playedHome, day))
-      setRosterOf(g.away, maybeInjure(rosterOf(g.away), playedAway, day))
+      const update = applyGameResult(g, result, nextRecords, homeRosterNow, awayRosterNow, myTeam, teams, day, date)
+      setRosterOf(g.home, update.homeRoster)
+      setRosterOf(g.away, update.awayRoster)
+      if (update.newResult) newResults.unshift(update.newResult)
+      if (update.boxScore) lastBoxScore = update.boxScore
     })
 
     // Heal anyone whose return day has passed, league-wide, every day.
@@ -1977,7 +2166,8 @@ export function simDays(args: SimDaysArgs): SimDaysResult {
     allStarMvp,
     seasonComplete,
     newTransactions,
-    pickAssets
+    pickAssets,
+    pendingUserGame
   }
 }
 

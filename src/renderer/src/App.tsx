@@ -37,6 +37,7 @@ import DraftRoom from '@renderer/pages/dashboard/DraftRoom'
 import DraftCombine from '@renderer/pages/dashboard/DraftCombine'
 import ProspectScouting from '@renderer/pages/dashboard/ProspectScouting'
 import Offseason from '@renderer/pages/dashboard/Offseason'
+import PlayGame from '@renderer/pages/dashboard/PlayGame'
 
 const PAGES: Record<string, React.ComponentType> = {
   home: Home,
@@ -70,7 +71,8 @@ const PAGES: Record<string, React.ComponentType> = {
   draft: DraftRoom,
   draftCombine: DraftCombine,
   prospectScouting: ProspectScouting,
-  offseason: Offseason
+  offseason: Offseason,
+  playGame: PlayGame
 }
 
 function Dashboard(): React.JSX.Element {

@@ -21,6 +21,10 @@ export default function SimBar(): React.JSX.Element {
   const offseasonPhase = useGameStore((s) => s.offseasonPhase)
   const seasonNumber = useGameStore((s) => s.seasonNumber)
   const goToPage = useGameStore((s) => s.goToPage)
+  const pendingUserGame = useGameStore((s) => s.pendingUserGame)
+  const leagueTeams = useGameStore((s) => s.leagueTeams)
+  const startLiveGame = useGameStore((s) => s.startLiveGame)
+  const resolvePendingUserGameAutomatically = useGameStore((s) => s.resolvePendingUserGameAutomatically)
 
   const gamesPerSeason = config?.gamesPerSeason ?? 82
   const simDateStr = `${MONTHS[simDate.m - 1]} ${simDate.d}, ${simDate.y}`
@@ -44,6 +48,10 @@ export default function SimBar(): React.JSX.Element {
   const recordStr = record ? `${record.w}–${record.l}` : '0–0'
 
   const dividerStyle = { width: 1, height: 22, background: '#1E1E1B', flexShrink: 0 } as const
+
+  const opponentAbbr = pendingUserGame ? (pendingUserGame.home === myTeam ? pendingUserGame.away : pendingUserGame.home) : null
+  const opponentTeam = opponentAbbr ? leagueTeams.find((t) => t.abbr === opponentAbbr) : null
+  const opponentLabel = opponentTeam ? `${opponentTeam.city} ${opponentTeam.name}` : opponentAbbr
 
   return (
     <div
@@ -154,6 +162,48 @@ export default function SimBar(): React.JSX.Element {
             }}
           >
             Offseason Hub
+          </button>
+        </div>
+      ) : pendingUserGame ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          <span style={{ fontFamily: FONTS.body, fontSize: 12, color: '#D8D6D1' }}>
+            You play <strong style={{ color: 'white' }}>{opponentLabel}</strong> today
+          </span>
+          <button
+            onClick={startLiveGame}
+            className="hover-dim"
+            style={{
+              padding: '6px 14px',
+              background: COLORS.accent,
+              color: 'white',
+              border: 'none',
+              fontFamily: FONTS.display,
+              fontWeight: 900,
+              fontSize: 12,
+              letterSpacing: 2,
+              cursor: 'pointer',
+              textTransform: 'uppercase'
+            }}
+          >
+            Play This Game
+          </button>
+          <button
+            onClick={resolvePendingUserGameAutomatically}
+            className="hover-simbtn"
+            style={{
+              padding: '6px 14px',
+              background: '#1E1E1B',
+              color: '#AEACA8',
+              border: '1px solid #2A2A26',
+              fontFamily: FONTS.display,
+              fontWeight: 700,
+              fontSize: 12,
+              letterSpacing: 2,
+              cursor: 'pointer',
+              textTransform: 'uppercase'
+            }}
+          >
+            Auto-Resolve
           </button>
         </div>
       ) : (
